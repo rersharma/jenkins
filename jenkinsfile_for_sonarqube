@@ -1,0 +1,70 @@
+pipeline {
+    agent any
+    tools {
+        maven "MAVEN3.9"
+        jdk "JDK17"
+    }
+    stages {
+        stage("Harjinder Fetch Code") {
+            steps {
+                echo "======== Executing Fetching Code From GitHub ========"
+                git branch: 'master', url: 'https://github.com/rersharma/vprofile-atom.git'
+            }
+        }
+        stage("Maven Unit Test") {
+            steps {
+                echo "======== Maven Test ========"
+                sh 'mvn test'
+            }
+        }
+        stage("Code Build") {
+            steps {
+                echo "======== Code Build ========"
+                sh 'mvn install -DskipTests'
+            }
+            post {
+                success {
+                    echo "======== Pipeline Executed Successfully ========"
+                    echo "======== Now Archive The Artifacts ========"
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+        stage("CODE ANALYSIS WITH CHECKSTYLE") {
+            steps {
+                sh 'mvn checkstyle:checkstyle'
+                script {
+                    def checkstyleFile = 'target/checkstyle-result.xml'
+                    if (fileExists(checkstyleFile)) {
+                        echo "Checkstyle report found: ${checkstyleFile}"
+                        sh "ls -l ${checkstyleFile}"
+                    } else {
+                        error "Checkstyle report not found!"
+                    }
+                }
+            }
+            post {
+                success {
+                    echo 'Generated Analysis Result'
+                }
+            }
+        }
+        stage("CODE ANALYSIS with SONARQUBE") {
+            steps {
+                withSonarQubeEnv('sonarserver') { // Make sure 'sonarserver' matches the Jenkins config
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh """${tool 'sonarscanner4'}/bin/sonar-scanner \
+                            -Dsonar.projectKey=vprofile \
+                            -Dsonar.projectName=vprofile-repo \
+                            -Dsonar.projectVersion=1.0 \
+                            -Dsonar.sources=src/ \
+                            -Dsonar.java.binaries=target/classes \
+                            -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                            -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                            -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+    }
+}
