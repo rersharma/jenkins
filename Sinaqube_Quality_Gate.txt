@@ -1,0 +1,87 @@
+pipeline {
+    agent any
+    tools {
+        maven "MAVEN3.9"
+        jdk "JDK17"
+    }
+    stages {
+        stage("Harjinder Fetch Code") {
+            steps {
+                echo "======== Fetching Code From GitHub ========"
+                git branch: 'master', url: 'https://github.com/rersharma/vprofile-atom.git'
+            }
+        }
+        stage("Maven Unit Test") {
+            steps {
+                echo "======== Running Unit Tests ========"
+                sh 'mvn test'
+            }
+        }
+        stage("Code Build") {
+            steps {
+                echo "======== Building the Code ========"
+                sh 'mvn install -DskipTests'
+            }
+            post {
+                success {
+                    echo "======== Build Successful ========"
+                    echo "======== Archiving Artifacts ========"
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+        stage("Code Analysis with Checkstyle") {
+            steps {
+                echo "======== Running Checkstyle ========"
+                sh 'mvn checkstyle:checkstyle'
+                script {
+                    def checkstyleFile = 'target/checkstyle-result.xml'
+                    if (fileExists(checkstyleFile)) {
+                        echo "Checkstyle report found: ${checkstyleFile}"
+                        sh "ls -l ${checkstyleFile}"
+                    } else {
+                        error "Checkstyle report not found!"
+                    }
+                }
+            }
+            post {
+                success {
+                    echo '======== Checkstyle Analysis Completed ========'
+                }
+            }
+        }
+        stage("Code Analysis with SonarQube") {
+            steps {
+                withSonarQubeEnv('sonarserver') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh """${tool 'sonarscanner4'}/bin/sonar-scanner \
+                            -Dsonar.projectKey=vprofile \
+                            -Dsonar.projectName=vprofile-repo \
+                            -Dsonar.projectVersion=1.0 \
+                            -Dsonar.sources=src/ \
+                            -Dsonar.java.binaries=target/classes \
+                            -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                            -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                            -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+        stage("Quality Gate Check") {
+            steps {
+                script {
+                    def qualityGate = waitForQualityGate()
+                    if (qualityGate.status != 'OK') {
+                        error "Quality Gate failed: ${qualityGate.status}"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        always {
+            echo "======== Cleaning Up ========"
+            cleanWs() // Clean workspace after the pipeline finishes
+        }
+    }
+}
