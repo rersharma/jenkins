@@ -1,0 +1,135 @@
+def COLOR_MAP=[
+    
+     'SUCCESS': 'good',
+     'FAILURE': 'danger',
+    
+    ]
+
+pipeline {
+    agent any
+    tools {
+        maven "MAVEN3.9"
+        jdk "JDK17"
+    }
+      environment {
+        NEXUS_VERSION = "nexus3"
+        NEXUS_PROTOCOL = "http"
+        NEXUS_URL = "3.109.47.206:8081"
+        NEXUS_REPOSITORY = "vprofile-repo"
+    	NEXUS_REPO_ID    = "vprofile-rep"
+        NEXUS_CREDENTIAL_ID = "nexuslogin"
+        ARTVERSION = "${env.BUILD_ID}"
+    }
+    stages {
+        stage("Harjinder Fetch Code") {
+            steps {
+                echo "======== Fetching Code From GitHub ========"
+                git branch: 'master', url: 'https://github.com/rersharma/vprofile-atom.git'
+            }
+        }
+        stage("Maven Unit Test") {
+            steps {
+                echo "======== Running Unit Tests ========"
+                sh 'mvn test'
+            }
+        }
+        stage("Code Build") {
+            steps {
+                echo "======== Building the Code ========"
+                sh 'mvn install -DskipTests'
+            }
+            post {
+                success {
+                    echo "======== Build Successful ========"
+                    echo "======== Archiving Artifacts ========"
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+            }
+        }
+        stage("Code Analysis with Checkstyle") {
+            steps {
+                echo "======== Running Checkstyle ========"
+                sh 'mvn checkstyle:checkstyle'
+                script {
+                    def checkstyleFile = 'target/checkstyle-result.xml'
+                    if (fileExists(checkstyleFile)) {
+                        echo "Checkstyle report found: ${checkstyleFile}"
+                        sh "ls -l ${checkstyleFile}"
+                    } else {
+                        error "Checkstyle report not found!"
+                    }
+                }
+            }
+            post {
+                success {
+                    echo '======== Checkstyle Analysis Completed ========'
+                }
+            }
+        }
+        stage("Code Analysis with SonarQube") {
+            steps {
+                withSonarQubeEnv('sonarserver') {
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh """${tool 'sonarscanner4'}/bin/sonar-scanner \
+                            -Dsonar.projectKey=vprofile \
+                            -Dsonar.projectName=vprofile-repo \
+                            -Dsonar.projectVersion=1.0 \
+                            -Dsonar.sources=src/ \
+                            -Dsonar.java.binaries=target/classes \
+                            -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                            -Dsonar.jacoco.reportsPath=target/jacoco.exec \
+                            -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+     stage("Publish to Nexus Repository Manager") {
+            steps {
+                script {
+                    pom = readMavenPom file: "pom.xml";
+                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}");
+                    echo "${filesByGlob[0].name} ${filesByGlob[0].path} ${filesByGlob[0].directory} ${filesByGlob[0].length} ${filesByGlob[0].lastModified}"
+                    artifactPath = filesByGlob[0].path;
+                    artifactExists = fileExists artifactPath;
+                    if(artifactExists) {
+                        echo "*** File: ${artifactPath}, group: ${pom.groupId}, packaging: ${pom.packaging}, version ${pom.version} ARTVERSION";
+                        nexusArtifactUploader(
+                            nexusVersion: NEXUS_VERSION,
+                            protocol: NEXUS_PROTOCOL,
+                            nexusUrl: NEXUS_URL,
+                            groupId: pom.groupId,
+                            version: ARTVERSION,
+                            repository: NEXUS_REPOSITORY,
+                            credentialsId: NEXUS_CREDENTIAL_ID,
+                            artifacts: [
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: artifactPath,
+                                type: pom.packaging],
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: "pom.xml",
+                                type: "pom"]
+                            ]
+                        );
+                    } 
+		    else {
+                        error "*** File: ${artifactPath}, could not be found";
+                    }
+                }
+            }
+        }
+    }
+    
+    post 
+    {
+          always 
+          {
+              echo 'Slack Notification'
+              slackSend channel: '#davprojectcicd',
+                  color:COLOR_MAP[currentBuild.currentResult],
+                  message: "*${currentBuild.currentResult}:*Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info at : ${env.BUILD_URL}"
+          }
+    }
+   
+}
