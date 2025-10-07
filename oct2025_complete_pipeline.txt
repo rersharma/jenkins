@@ -1,0 +1,210 @@
+def COLOR_MAP = [
+    'SUCCESS' : 'good',
+    'FAILURE' : 'danger',
+]
+
+pipeline {
+    agent any
+
+    tools {
+        maven "Maven3.9"
+        jdk "java17"
+    }
+    environment
+    {
+        NEXUS_VERSION="nexus3"
+        NEXUS_PROTOCOL="http"
+        NEXUS_URL="3.111.131.103:8081"
+        NEXUS_REPOSITORY="vprofile_repo"
+        NEXUS_CREDENTIALS_ID="nexuslog"
+        ARTVERSION="${env.BUILD_ID}"
+        EC2_USER = "ubuntu" //usrname of webserver
+        EC2_HOST = "13.127.248.161"
+        EC2_KEY_PATH= "/var/lib/jenkins/.ssh/websitekey.pem"
+        TOMCAT_WEBAPP_DIR= "/usr/local/tomcat/webapps/ROOT"
+    }
+
+    stages {
+        stage("Fetch code from github") {
+            steps {
+                echo "--------- Fetching code from Github ----------"
+                git branch: 'master', url: 'https://github.com/manish-bartwal/java_project.git'
+            }
+        }
+
+        stage("Maven Unit Test") {
+            steps {
+                echo "--------- Running Unit Test ----------"
+                sh 'mvn test'
+            }
+        }
+
+        stage("Code Build") {
+            steps {
+                echo "--------- Code is Built ----------"
+                sh 'mvn install'
+            }
+            post {
+                success {
+                    echo "--------- Built successfully ----------"
+                    echo "--------- Archive Successfully ----------"
+                    archiveArtifacts artifacts: '**/*.war'
+                }
+                failure {
+                    echo "--------- Build failed ----------"
+                }
+            }
+        }
+
+        stage("Code analysis with checkstyle")
+        {
+            steps
+            {
+                echo "Running Checkstyle"
+                sh 'mvn checkstyle:checkstyle'
+                script
+                {
+                    def reportfile='target/checkstyle-result.xml'
+                    if (fileExists(reportfile))
+                    {
+                        echo 'Checkstyle Found'
+                        sh "ls -l"
+                    }
+                    else
+                    {
+                        echo "Checkstyle not found"
+                    }
+                }
+            }
+        }
+        stage("Code analysis with sonarqube")
+        {
+            steps
+            {
+                withSonarQubeEnv("Sonar_qube_chd")
+                {
+                    timeout(time:10, unit: 'MINUTES')
+                    {
+                        sh """${tool 'sonarscannertool'}/bin/sonar-scanner \
+                        -Dsonar.projectKey=Davproject \
+                        -Dsonar.projectName=Davproject-repo \
+                        -Dsonar.projectVersion=1.0 \
+                        -Dsonar.sources=src/ \
+                        -Dsonar.java.binaries=target/classes \
+                        -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                        -Dsonar.jacoco.reportsPath=target/jacoco.exe \
+                        -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+        stage("Quality gate check")
+        {
+            steps
+            {
+                script
+                {
+                     def qualityGate = waitForQualityGate()
+                     if(qualityGate.status != 'OK')
+                     {
+                        error "Quality gate failed: ${qualitygate.status}"
+                     }
+                }
+            }
+        }
+        stage("Publish To Nexus")
+        {
+            steps
+            {
+                script
+                {
+                    pom=readMavenPom file: "pom.xml";
+                    filefind=findFiles(glob: "target/*.${pom.packaging}");
+                    artifactpath=filefind[0].path;
+                    check_exists=fileExists artifactpath;
+                    def ARTIVERSION = "${env.BUILD_ID}"
+                    if(check_exists)
+                    {
+                        nexusArtifactUploader(
+                            nexusVersion:NEXUS_VERSION,
+                            protocol:NEXUS_PROTOCOL,
+                            nexusUrl:NEXUS_URL,
+                            groupId:pom.groupId,
+                            version:ARTIVERSION,
+                            repository:NEXUS_REPOSITORY,
+                            credentialsId:NEXUS_CREDENTIALS_ID,
+                            artifacts:[
+                                [artifactId:pom.artifactId,
+                                 classifier: '',
+                                 file:artifactpath,
+                                 type:pom.packaging],
+                                 [
+                                     artifactId:pom.artifactId,
+                                     classifier: '',
+                                     file:'pom.xml',
+                                     type:"pom"]
+                                ]
+                            );
+                    }
+                    else{
+                           echo "Artifact not found to publishh"
+                        }
+
+                    }
+                }
+            }
+            
+        stage("Deploy To Ec2")
+         {
+             steps 
+             {
+                  script 
+                  {
+                         echo "====Deploying To Ec2 Instance======="
+                         def artifactFile='target/*.war'
+                         def artifact=findFiles(glob:artifactFile)[0]
+                         def artifactname=artifact.name
+                         def artifactpath=artifact.path
+                         def renamedArtifactPath="target/ROOT.war"
+                         // Rename Only if its not Already ROOT.war
+                         if(artifactname!='ROOT.war')
+                         {
+                             echo "Renaming ${artifactname} to ROOt.war"
+                             sh "cp ${artifactpath} ${renamedArtifactPath}"
+                         }
+                         else 
+                         {
+                             renamedArtifactPath=artifactpath
+                             echo "Artifact is Already Renamed No Need To Rename it"
+                         }
+                         
+                         echo "Deploying...... ${renamedArtifactPath}"
+                        sh """
+                        # 1️⃣ Remove old ROOT app
+                        ssh -o StrictHostKeyChecking=no -i ${EC2_KEY_PATH} ubuntu@${EC2_HOST} "sudo rm -rf /usr/local/tomcat/webapps/ROOT /usr/local/tomcat/webapps/ROOT.war"
+                        
+                        # 2️⃣ Upload WAR to /tmp (no sudo needed)
+                        scp -o StrictHostKeyChecking=no -i ${EC2_KEY_PATH} target/ROOT.war ubuntu@${EC2_HOST}:/tmp/ROOT.war
+                        
+                        # 3️⃣ Move WAR to webapps and restart Tomcat
+                        ssh -o StrictHostKeyChecking=no -i ${EC2_KEY_PATH} ubuntu@${EC2_HOST} "sudo mv /tmp/ROOT.war /usr/local/tomcat/webapps/ROOT.war && sudo systemctl restart tomcat"
+                        """
+                  }
+             }
+         }
+        }
+    
+
+    post {
+        always {
+            echo "Pipeline finished"
+            echo "Slack Notification "
+            slackSend(
+                channel : '#all-dav-project',
+                color: COLOR_MAP[currentBuild.currentResult] ?: 'danger',
+                message: "Status of Pipeline is ${currentBuild.currentResult ?: 'UNKNOWN'}\nJob: '${env.JOB_NAME}' Build #${env.BUILD_NUMBER}\nMore Info At: ${env.BUILD_URL}"
+            )           
+           // cleanWs() //cleans workspace after the pipeline finished...
+        }
+    }
+}
