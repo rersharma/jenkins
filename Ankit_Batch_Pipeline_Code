@@ -1,0 +1,193 @@
+def COLOR_MAP = [
+    'SUCCESS' : 'good',
+    'FAILURE' : 'danger',
+]
+def dockerImage
+pipeline {
+    agent any
+
+    tools {
+        maven "Maven3.9"
+        jdk "jdk17"
+    }
+    environment
+    {
+         registryCredential='ecr:ap-south-1:awscreds'
+         imageName= "864753715476.dkr.ecr.ap-south-1.amazonaws.com/vprofileappimg"
+         vprofileRegistry="https://864753715476.dkr.ecr.ap-south-1.amazonaws.com"
+         
+         NEXUS_VERSION="nexus3"
+         NEXUS_PROTOCOl="http"
+         NEXUS_URL="13.233.249.121:8081"
+         NEXUS_REPOSITORY="vprofile-repo"
+         NEXUS_CREDENTIALS_ID="nexuslog"
+         ARTVERSION="${env.BUILD_ID}"
+         cluster="Vprofile"
+         service="vprofileappsvc"
+    }
+
+    stages {
+        stage("Fetch code from github") {
+            steps {
+                echo "--------- Fetching code from Github ----------"
+                git branch: 'main', url: 'https://github.com/rersharma/Java_Ecr_jen.git'
+            }
+        }
+
+        stage("Maven Unit Test") {
+            steps {
+                echo "--------- Running Unit Test ----------"
+                sh 'mvn test'
+            }
+        }
+
+        stage("Code Build") {
+            steps {
+                echo "--------- Code is Built ----------"
+                sh 'mvn install'
+            }
+            post {
+                success {
+                    echo "--------- Built successfully ----------"
+                    echo "--------- Archive Successfully ----------"
+                    archiveArtifacts artifacts: 'target/*.war'
+                }
+                failure {
+                    echo "--------- Build failed ----------"
+                }
+            }
+        }
+
+        stage("Code analysis with checkstyle") {
+            steps {
+                echo "Running Checkstyle"
+                sh 'mvn checkstyle:checkstyle'
+                script {
+                    def reportfile = 'target/checkstyle-result.xml'
+                    if (fileExists(reportfile)) {
+                        echo 'Checkstyle Report Found ✅'
+                        sh "ls -l target/"
+                    } else {
+                        echo "Checkstyle Report not found ❌"
+                    }
+                }
+            }
+        }
+
+        stage("Code analysis with SonarQube") {
+            steps {
+                withSonarQubeEnv("sonarqube_chd") { // must match Jenkins SonarQube config
+                    timeout(time: 10, unit: 'MINUTES') {
+                        sh """${tool 'sonarscannertool'}/bin/sonar-scanner \
+                          -Dsonar.projectKey=Davproject \
+                          -Dsonar.projectName=Davproject-repo \
+                          -Dsonar.projectVersion=1.0 \
+                          -Dsonar.sources=src/ \
+                          -Dsonar.java.binaries=target/classes \
+                          -Dsonar.junit.reportsPath=target/surefire-reports/ \
+                          -Dsonar.jacoco.reportPaths=target/jacoco.exec \
+                          -Dsonar.java.checkstyle.reportPaths=target/checkstyle-result.xml"""
+                    }
+                }
+            }
+        }
+        stage("Quality  Gate Check")
+        {
+             steps 
+             {
+                 script
+                 {
+                  def qualitygate = waitForQualityGate()
+                  if(qualitygate.status !='OK')
+                  {
+                      error "Quality Gate Failed: ${qualitygate.status}"
+                  }
+                 }
+             } 
+        }
+        stage("Publish to Nexus Repository Manager") {
+            steps {
+                script {
+                    pom = readMavenPom file: "pom.xml";
+                    filesByGlob = findFiles(glob: "target/*.${pom.packaging}");
+                    artifactPath = filesByGlob[0].path;
+                    artifactExists = fileExists artifactPath;
+                    if(artifactExists) {
+                            nexusArtifactUploader(
+                            nexusVersion: NEXUS_VERSION,
+                            protocol: NEXUS_PROTOCOL,
+                            nexusUrl: NEXUS_URL,
+                            groupId: pom.groupId,
+                            version: ARTVERSION,
+                            repository: NEXUS_REPOSITORY,
+                            credentialsId:NEXUS_CREDENTIALS_ID,
+                            artifacts: [
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: artifactPath,
+                                type:pom.packaging],
+                                [artifactId: pom.artifactId,
+                                classifier: '',
+                                file: "pom.xml",
+                                type: "pom"]
+                            ]
+                        );
+                    } 
+                     else 
+                     {
+                         echo "Artifcat Not Found Not Publish"
+                     }
+                     
+                 }
+             }
+        }
+         stage("Build App Image")
+         {
+              steps 
+              {
+                  script
+                  {
+                      dockerImage=dockerimage=docker.build(imageName + ":$BUILD_NUMBER","./Docker-files/app/multistage/")
+                  }
+              }
+         }
+         
+         stage('upload Docker App Image in Aws ECR')
+         {
+             steps
+             {
+                 script 
+                 {
+                      docker.withRegistry(vprofileRegistry,registryCredential)
+                      {
+                             dockerImage.push("$BUILD_NUMBER")
+                             dockerImage.push('latest')
+                      }
+                 }
+             }
+         }
+         stage('Deploy To Ecs')
+         {
+             steps 
+             {
+                  withAWS(credentials:'awscreds',region:'ap-south-1')
+                  {
+                      sh 'aws ecs update-service --cluster ${cluster} --service ${service} --force-new-deployment'
+                  }
+             }
+         }
+    }
+    
+    post {
+        always {
+            echo "Pipeline finished ✅"
+            echo "Slack Notification "
+            slackSend channel : '#all-davunvi',
+            color: COLOR_MAP[currentBuild.currentResult],
+            message: "Status of Pipeline is *${currentBuild.currentResult}:* Job ${env.JOB_NAME} build ${env.BUILD_NUMBER} \n More info At : ${env.BUILD_URL}"
+            
+          //  cleanWs() // Clean Workspace after the pipeline Finsih
+            
+        }
+    }
+}
